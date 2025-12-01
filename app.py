@@ -323,13 +323,8 @@ def render_championship_view(year, schedule):
     if schedule is not None and not schedule.empty:
         st.subheader("📅 Race Calendar")
         
-        # Sort: Recent/Upcoming first
-        # We'll sort by date descending so the latest races are at the top
-        today = pd.Timestamp.now(tz='UTC')
-        schedule['Session5Date'] = pd.to_datetime(schedule['Session5Date'], utc=True)
-        schedule['DateDiff'] = (schedule['Session5Date'] - today).abs()
-        # Sort by date descending (newest first)
-        events_to_show = schedule.sort_values(by='Session5Date', ascending=False)
+        # Sort: Latest Round first (Descending order of RoundNumber)
+        events_to_show = schedule.sort_values(by='RoundNumber', ascending=False)
         
         # Grid layout
         cols = st.columns(3)
@@ -396,8 +391,8 @@ def render_championship_view(year, schedule):
         </style>
         """, unsafe_allow_html=True)
 
-        for idx, row in events_to_show.iterrows():
-            col = cols[idx % 3]
+        for i, (idx, row) in enumerate(events_to_show.iterrows()):
+            col = cols[i % 3]
             with col:
                 try:
                     # Convert to IST
@@ -559,7 +554,7 @@ def render_telemetry_tab(session):
     st.subheader("Driver Telemetry Analysis")
     driver_map = session.results.set_index('FullName')['Abbreviation'].to_dict()
     drivers = list(driver_map.keys())
-    selected_drivers = st.multiselect("Select Drivers to Compare", drivers, default=drivers)
+    selected_drivers = st.multiselect("Select Drivers to Compare", drivers, default=drivers[:2] if len(drivers) >= 2 else drivers)
     
     if selected_drivers:
         fig_speed = go.Figure()
@@ -569,6 +564,27 @@ def render_telemetry_tab(session):
         fig_gear = go.Figure()
         fig_drs = go.Figure()
         
+        # Calculate Sector Lines (based on first driver)
+        sector_lines = []
+        try:
+            ref_driver = driver_map[selected_drivers[0]]
+            ref_lap = session.laps.pick_driver(ref_driver).pick_fastest()
+            if ref_lap is not None:
+                ref_tel = ref_lap.get_telemetry()
+                # Get Sector Times
+                s1_time = ref_lap['Sector1SessionTime']
+                s2_time = ref_lap['Sector2SessionTime']
+                
+                # Find corresponding distances
+                if not pd.isnull(s1_time):
+                    s1_dist = ref_tel.loc[(ref_tel['SessionTime'] - s1_time).abs().idxmin(), 'Distance']
+                    sector_lines.append((s1_dist, "Sector 1"))
+                if not pd.isnull(s2_time):
+                    s2_dist = ref_tel.loc[(ref_tel['SessionTime'] - s2_time).abs().idxmin(), 'Distance']
+                    sector_lines.append((s2_dist, "Sector 2"))
+        except:
+            pass
+
         for driver_name in selected_drivers:
             driver_abbr = driver_map[driver_name]
             try:
@@ -591,25 +607,37 @@ def render_telemetry_tab(session):
             except Exception as e:
                 st.warning(f"Could not load telemetry for {driver_name}: {e}")
         
+        # Helper to add sector lines
+        def add_sector_lines(fig):
+            for dist, label in sector_lines:
+                fig.add_vline(x=dist, line_width=1, line_dash="dash", line_color="gray")
+                fig.add_annotation(x=dist, y=1, yref="paper", text=label, showarrow=False, font=dict(color="gray"))
+
+        add_sector_lines(fig_speed)
         fig_speed.update_layout(title="Speed Trace", xaxis_title="Distance (m)", yaxis_title="Speed (km/h)")
         st.plotly_chart(fig_speed, use_container_width=True)
         
         col1, col2 = st.columns(2)
         with col1:
+            add_sector_lines(fig_throttle)
             fig_throttle.update_layout(title="Throttle Trace", xaxis_title="Distance (m)", yaxis_title="Throttle %")
             st.plotly_chart(fig_throttle, use_container_width=True)
         with col2:
+            add_sector_lines(fig_brake)
             fig_brake.update_layout(title="Brake Trace", xaxis_title="Distance (m)", yaxis_title="Brake")
             st.plotly_chart(fig_brake, use_container_width=True)
             
         col3, col4 = st.columns(2)
         with col3:
+            add_sector_lines(fig_rpm)
             fig_rpm.update_layout(title="RPM Trace", xaxis_title="Distance (m)", yaxis_title="RPM")
             st.plotly_chart(fig_rpm, use_container_width=True)
         with col4:
+            add_sector_lines(fig_gear)
             fig_gear.update_layout(title="Gear Trace", xaxis_title="Distance (m)", yaxis_title="Gear")
             st.plotly_chart(fig_gear, use_container_width=True)
             
+        add_sector_lines(fig_drs)
         fig_drs.update_layout(title="DRS Trace", xaxis_title="Distance (m)", yaxis_title="DRS Status")
         st.plotly_chart(fig_drs, use_container_width=True)
 
@@ -619,14 +647,72 @@ def render_lap_comparison_tab(session):
     valid_laps = laps.pick_quicklaps()
     
     if not valid_laps.empty:
+        # 1. Box Plot
         valid_laps['LapTimeSeconds'] = valid_laps['LapTime'].dt.total_seconds()
         fig_laps = px.box(valid_laps, x="Team", y="LapTimeSeconds", color="Team", title="Lap Time Distribution by Team")
         st.plotly_chart(fig_laps, use_container_width=True)
         
+        # 2. Scatter Plot
         driver_map_reverse = session.results.set_index('Abbreviation')['FullName'].to_dict()
         valid_laps['DriverName'] = valid_laps['Driver'].map(driver_map_reverse)
         fig_scatter = px.scatter(valid_laps, x="LapNumber", y="LapTimeSeconds", color="DriverName", title="Lap Times per Lap")
         st.plotly_chart(fig_scatter, use_container_width=True)
+        
+        # 3. Head-to-Head Table
+        st.markdown("### ⚔️ Head-to-Head Analysis")
+        drivers = list(driver_map_reverse.values())
+        d_abbr_map = {v: k for k, v in driver_map_reverse.items()}
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            d1_name = st.selectbox("Driver 1", drivers, index=0)
+        with col2:
+            d2_name = st.selectbox("Driver 2", drivers, index=1 if len(drivers) > 1 else 0)
+            
+        if d1_name and d2_name and d1_name != d2_name:
+            d1_abbr = d_abbr_map[d1_name]
+            d2_abbr = d_abbr_map[d2_name]
+            
+            laps_d1 = valid_laps[valid_laps['Driver'] == d1_abbr][['LapNumber', 'LapTimeSeconds']].set_index('LapNumber')
+            laps_d2 = valid_laps[valid_laps['Driver'] == d2_abbr][['LapNumber', 'LapTimeSeconds']].set_index('LapNumber')
+            
+            # Join
+            df_compare = laps_d1.join(laps_d2, lsuffix='_d1', rsuffix='_d2').dropna()
+            
+            if not df_compare.empty:
+                df_compare['Delta'] = df_compare['LapTimeSeconds_d1'] - df_compare['LapTimeSeconds_d2']
+                df_compare['Winner'] = df_compare['Delta'].apply(lambda x: d2_name if x > 0 else d1_name)
+                df_compare['Gap'] = df_compare['Delta'].abs().apply(lambda x: f"{x:.3f}s")
+                
+                # Format for display
+                display_df = df_compare.reset_index()
+                display_df = display_df[['LapNumber', 'Winner', 'Gap', 'LapTimeSeconds_d1', 'LapTimeSeconds_d2']]
+                display_df.columns = ['Lap', 'Winner', 'Gap', f'{d1_name} Time', f'{d2_name} Time']
+                
+                st.dataframe(display_df, use_container_width=True)
+                
+                # Visualization of the Delta
+                fig_delta = px.bar(
+                    df_compare.reset_index(), 
+                    x='LapNumber', 
+                    y='Delta', 
+                    color='Winner',
+                    title=f"Lap Time Delta: {d1_name} vs {d2_name}",
+                    labels={'Delta': 'Time Delta (s)', 'LapNumber': 'Lap Number'},
+                    color_discrete_map={d1_name: '#ff1801', d2_name: '#1f77b4'} # Example colors
+                )
+                # Add a reference line at 0
+                fig_delta.add_hline(y=0, line_width=1, line_color="white")
+                
+                # Update layout for better readability
+                fig_delta.update_layout(
+                    yaxis_title=f"Gap (s) - < 0: {d1_name} Faster | > 0: {d2_name} Faster",
+                    legend_title="Lap Winner"
+                )
+                
+                st.plotly_chart(fig_delta, use_container_width=True)
+            else:
+                st.info("No overlapping clean laps found for comparison.")
 
 def render_track_map_tab(session, selected_event_name):
     st.subheader("Track Map")
