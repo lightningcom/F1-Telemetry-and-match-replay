@@ -768,15 +768,18 @@ def render_track_map_tab(session, selected_event_name):
     except Exception as e:
         st.warning(f"Could not generate track map: {e}")
 
+import json
+import streamlit.components.v1 as components
+
 def render_replay_tab(session):
-    st.subheader("Race Replay Animation")
+    st.subheader("Race Replay (Canvas Engine)")
     
     # 1. Selection Controls
-    col1, col2 = st.columns([1, 2])
+    col1, col2, col3 = st.columns([1, 2, 1])
     with col1:
         total_laps = int(session.laps['LapNumber'].max())
         lap_options = ["Full Race"] + list(range(1, total_laps + 1))
-        selected_lap = st.selectbox("Select Lap", lap_options, index=1) # Default to Lap 1
+        selected_lap = st.selectbox("Select Lap", lap_options, index=1)
     
     with col2:
         driver_map = session.results.set_index('FullName')['Abbreviation'].to_dict()
@@ -784,56 +787,87 @@ def render_replay_tab(session):
         default_drivers = all_drivers[:5] if len(all_drivers) >= 5 else all_drivers
         replay_drivers = st.multiselect("Select Drivers", all_drivers, default=default_drivers)
     
-    focus_driver = st.selectbox("Focus Driver (Camera/Telemetry)", replay_drivers, index=0 if replay_drivers else None)
-    
-    if not replay_drivers or not focus_driver:
+    with col3:
+        focus_driver_name = st.selectbox("Focus Driver", replay_drivers, index=0 if replay_drivers else None)
+        
+    if not replay_drivers or not focus_driver_name:
         st.info("Please select drivers to generate the replay.")
         return
 
     if st.button("Generate Replay", type="primary"):
-        progress_bar = st.progress(0)
         status_text = st.empty()
+        progress_bar = st.progress(0)
         
         try:
             with st.spinner("Processing telemetry data..."):
-                # 1. Setup Reference (Track Map)
+                # 1. Track Map Data
                 status_text.text("Building track map...")
                 ref_lap = session.laps.pick_fastest()
-                if ref_lap is None:
-                    ref_lap = session.laps.iloc[0]
-                
+                if ref_lap is None: ref_lap = session.laps.iloc[0]
                 ref_tel = ref_lap.get_telemetry()
-                track_x = ref_tel['X']
-                track_y = ref_tel['Y']
                 
-                # 2. Define Time Grid
+                # Simplify track data
+                track_data = [{'x': float(x), 'y': float(y)} for x, y in zip(ref_tel['X'], ref_tel['Y'])]
+                
+                # 2. Track Status Data
+                track_status_data = []
+                try:
+                    ts = session.track_status
+                    if ts is not None and not ts.empty:
+                        for _, row in ts.iterrows():
+                            track_status_data.append({
+                                't': row['Time'].total_seconds(),
+                                's': row['Status']
+                            })
+                except Exception:
+                    pass
+
+                # 3. Time Grid & Lap Data
+                lap_start_times = []
+                
                 if selected_lap == "Full Race":
-                    # For full race, we need a coarser grid to avoid crashing the browser
                     start_t = session.laps['LapStartTime'].min().total_seconds()
                     end_t = session.laps['Time'].max().total_seconds()
                     duration = end_t - start_t
-                    step = 5.0 if duration > 3600 else 2.0 # Adaptive step
+                    # Use 1.0s steps for Full Race to keep JSON size manageable while allowing smooth JS interpolation
+                    step = 1.0 
                     time_grid = np.arange(start_t, end_t, step)
+                    
+                    # Get Lap Start Times for Focus Driver (or winner) for the Lap Counter
+                    try:
+                        f_abbr = driver_map[focus_driver_name]
+                        f_laps = session.laps.pick_driver(f_abbr)
+                        # Create list of {lap: N, time: T}
+                        for _, row in f_laps.iterrows():
+                            # Handle potential NaT
+                            if pd.notnull(row['LapStartTime']):
+                                t_start = row['LapStartTime'].total_seconds()
+                            else:
+                                t_start = row['Time'].total_seconds() - row['LapTime'].total_seconds()
+                            
+                            lap_start_times.append({'l': int(row['LapNumber']), 't': t_start})
+                    except:
+                        pass
+                        
                 else:
-                    # For single lap, get the specific lap duration of the focus driver
-                    f_abbr = driver_map[focus_driver]
+                    f_abbr = driver_map[focus_driver_name]
                     f_laps = session.laps.pick_driver(f_abbr)
                     specific_lap = f_laps[f_laps['LapNumber'] == selected_lap]
-                    
                     if specific_lap.empty:
-                        st.error(f"Driver {focus_driver} did not complete Lap {selected_lap}.")
+                        st.error(f"Driver {focus_driver_name} did not complete Lap {selected_lap}.")
                         return
-                        
+                    
                     lap_duration = specific_lap['LapTime'].iloc[0].total_seconds()
-                    # Add a buffer
-                    time_grid = np.arange(0, lap_duration + 2.0, 0.4) # 0.4s resolution for smooth playback
+                    step = 0.2 
+                    time_grid = np.arange(0, lap_duration + 2.0, step)
+                    lap_start_times = [{'l': int(selected_lap), 't': 0}] # Static for single lap
 
-                # 3. Fetch and Interpolate Data
-                interpolated_data = {}
-                
+                # 4. Interpolate Data
+                drivers_data = {}
                 total_drivers = len(replay_drivers)
+                
                 for i, d_name in enumerate(replay_drivers):
-                    status_text.text(f"Processing {d_name} ({i+1}/{total_drivers})...")
+                    status_text.text(f"Processing {d_name}...")
                     progress_bar.progress((i + 1) / total_drivers)
                     
                     abbr = driver_map[d_name]
@@ -844,256 +878,477 @@ def render_replay_tab(session):
                             tel = d_laps.get_telemetry()
                             tel['TimeSec'] = tel['SessionTime'].dt.total_seconds()
                         else:
-                            # Filter for specific lap
                             lap_data = d_laps[d_laps['LapNumber'] == selected_lap]
-                            if lap_data.empty:
-                                continue
+                            if lap_data.empty: continue
+                            
+                            if 'LapStartTime' in lap_data.columns:
+                                start_time = lap_data['LapStartTime'].iloc[0].total_seconds()
+                            else:
+                                start_time = lap_data['Time'].iloc[0].total_seconds() - lap_data['LapTime'].iloc[0].total_seconds()
+                            
                             tel = lap_data.iloc[0].get_telemetry()
-                            tel['TimeSec'] = tel['Time'].dt.total_seconds()
-                        
-                        # Optimize: Only keep necessary columns and drop NaNs
-                        tel = tel[['TimeSec', 'X', 'Y', 'Speed', 'nGear', 'DRS', 'Distance', 'LapNumber']].dropna()
-                        
-                        # Interpolation
+                            tel['TimeSec'] = tel['Time'].dt.total_seconds() - start_time
+
+                        cols = ['TimeSec', 'X', 'Y', 'Speed', 'Distance', 'nGear', 'DRS']
+                        tel = tel[cols].dropna()
                         t_orig = tel['TimeSec'].values
                         
-                        # Safe interpolation
-                        x_new = np.interp(time_grid, t_orig, tel['X'].values, left=np.nan, right=np.nan)
-                        y_new = np.interp(time_grid, t_orig, tel['Y'].values, left=np.nan, right=np.nan)
-                        dist_new = np.interp(time_grid, t_orig, tel['Distance'].values, left=0, right=np.nan)
+                        x_new = np.interp(time_grid, t_orig, tel['X'].values, left=None, right=None)
+                        y_new = np.interp(time_grid, t_orig, tel['Y'].values, left=None, right=None)
+                        dist_new = np.interp(time_grid, t_orig, tel['Distance'].values, left=0, right=None)
                         speed_new = np.interp(time_grid, t_orig, tel['Speed'].values, left=0, right=0)
                         
-                        # Nearest neighbor for categorical/discrete
                         idx = np.searchsorted(t_orig, time_grid, side='right') - 1
                         idx = np.clip(idx, 0, len(t_orig)-1)
                         gear_new = tel['nGear'].values[idx]
                         drs_new = tel['DRS'].values[idx]
-                        interpolated_data[d_name] = pd.DataFrame({
-                            'X': x_new, 'Y': y_new, 'Distance': dist_new, 
-                            'Speed': speed_new, 'nGear': gear_new, 'DRS': drs_new
-                        })
                         
-                    except Exception as e:
-                        continue
-
-                status_text.text("Generating animation frames...")
-                
-                # --- Animation Frames ---
-                frames = []
-                
-                # Pre-calculate ranges for Follow Cam
-                window_size = 1000 # meters
-                
-                # Trail settings
-                trail_length = 5
-                
-                # Drivers to plot
-                drivers_to_plot = list(interpolated_data.keys())
-                
-                for i, t in enumerate(time_grid):
-                    frame_x = []
-                    frame_y = []
-                    frame_colors = []
-                    frame_sizes = []
-                    frame_opacities = []
-                    frame_hover = []
-                    
-                    # Leaderboard Data for this frame
-                    current_positions = []
-                    
-                    # Focus Driver Pos for Camera
-                    focus_x, focus_y = None, None
-                    
-                    for drv in drivers_to_plot:
-                        df = interpolated_data[drv]
                         try:
-                            # We can use index i directly as we interpolated to time_grid
-                            if i < len(df):
-                                row = df.iloc[i]
-                                if not pd.isna(row['X']) and not pd.isna(row['Y']):
-                                    # Current Position
-                                    curr_x = row['X']
-                                    curr_y = row['Y']
-                                    
-                                    # Store for Leaderboard
-                                    dist = row['Distance']
-                                    current_positions.append({
-                                        'Driver': drv,
-                                        'Distance': dist,
-                                        'Speed': row['Speed'],
-                                        'Gap': 0 # Placeholder
-                                    })
-                                    
-                                    if drv == focus_driver:
-                                        focus_x, focus_y = curr_x, curr_y
-                                    
-                                    # --- TRAIL GENERATION ---
-                                    # Add current point (Head)
-                                    frame_x.append(curr_x)
-                                    frame_y.append(curr_y)
-                                    
-                                    # Get color
-                                    abbr = driver_map[drv]
-                                    team_name = session.results.loc[session.results['Abbreviation'] == abbr, 'TeamName'].iloc[0]
-                                    color = fastf1.plotting.get_team_color(team_name, session=session)
-                                    
-                                    frame_colors.append(color)
-                                    frame_sizes.append(14 if drv == focus_driver else 10)
-                                    frame_opacities.append(1.0)
-                                    
-                                    # Hover Text
-                                    hover_txt = f"<b>{drv}</b><br>Speed: {row['Speed']:.0f} km/h<br>Gear: {row['nGear']:.0f}<br>DRS: {row['DRS']}"
-                                    frame_hover.append(hover_txt)
-                                    
-                                    # Add Trail Points (Tail)
-                                    for j in range(1, trail_length + 1):
-                                        if i - j >= 0:
-                                            prev_row = df.iloc[i - j]
-                                            if not pd.isna(prev_row['X']):
-                                                frame_x.append(prev_row['X'])
-                                                frame_y.append(prev_row['Y'])
-                                                # Same color
-                                                frame_colors.append(color)
-                                                # Smaller and Fader
-                                                frame_sizes.append((14 if drv == focus_driver else 10) * (1 - j/(trail_length+1)))
-                                                frame_opacities.append(1.0 - (j / (trail_length + 1)))
-                                                frame_hover.append(hover_txt) # Same hover for trail
-                                                
-                        except IndexError:
-                            pass
-                    
-                    # Sort positions for leaderboard
-                    current_positions.sort(key=lambda x: x['Distance'], reverse=True)
-                    
-                    # Calculate Gaps (approximate based on distance)
-                    if current_positions:
-                        leader_dist = current_positions[0]['Distance']
-                        for p in current_positions:
-                            p['Gap'] = (leader_dist - p['Distance']) / 200.0 # Rough approx seconds
-                    
-                    # Build Leaderboard Text
-                    lb_text = "<b>LEADERBOARD</b><br>"
-                    for p in current_positions[:10]: # Top 10
-                        gap_str = f"+{p['Gap']:.1f}s" if p['Gap'] > 0 else "LEADER"
-                        lb_text += f"{p['Driver']} {gap_str}<br>"
-                    
-                    # Telemetry Overlay Text (Focus Driver)
-                    tel_text = ""
-                    if focus_driver in [p['Driver'] for p in current_positions]:
-                        f_data = next(p for p in current_positions if p['Driver'] == focus_driver)
-                        tel_text = f"<b>{focus_driver}</b><br>Speed: {f_data['Speed']:.0f}<br>Gap: +{f_data['Gap']:.1f}s"
+                            team_name = session.results.loc[session.results['Abbreviation'] == abbr, 'TeamName'].iloc[0]
+                            color = fastf1.plotting.get_team_color(team_name, session=session)
+                        except:
+                            color = '#ffffff'
 
-                    # Camera Layout
-                    layout_update = {}
-                    # Check if follow_cam is defined, otherwise default to False (or handle UI state)
-                    # For now, let's assume we want full track unless specified. 
-                    # But we need to pass 'follow_cam' from UI. 
-                    # Since I can't easily add the checkbox variable in this edit without changing lines above, 
-                    # I will default to False or check st.session_state if I added it.
-                    # Let's just use the focus_x/y to center if we had the flag.
-                    # For now, I'll omit the dynamic camera update in the frame to avoid errors, 
-                    # or I can try to read a checkbox value if I can insert it earlier.
-                    # I'll stick to the Trails for now to fix the error.
+                        entries = []
+                        for j in range(len(time_grid)):
+                            if np.isnan(x_new[j]) or np.isnan(y_new[j]):
+                                entries.append(None)
+                            else:
+                                entries.append({
+                                    'x': round(float(x_new[j]), 1),
+                                    'y': round(float(y_new[j]), 1),
+                                    'd': round(float(dist_new[j]), 1),
+                                    's': int(speed_new[j]),
+                                    'g': int(gear_new[j]),
+                                    'drs': int(drs_new[j])
+                                })
+                        
+                        drivers_data[abbr] = {
+                            'color': color,
+                            'entries': entries
+                        }
+                        
+                    except Exception:
+                        continue
+                
+                payload = {
+                    'track': track_data,
+                    'track_status': track_status_data,
+                    'drivers': drivers_data,
+                    'time_steps': [round(float(t), 1) for t in time_grid],
+                    'lap_data': lap_start_times,
+                    'focus_driver': driver_map[focus_driver_name],
+                    'lap_number': selected_lap if selected_lap != "Full Race" else "Race"
+                }
+                
+                json_data = json.dumps(payload)
+                
+                html_code = f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <style>
+                        @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;700&family=Inter:wght@400;800&display=swap');
+                        
+                        body {{ margin: 0; background-color: #000000; color: white; font-family: 'Inter', sans-serif; overflow: hidden; }}
+                        #game-container {{ position: relative; width: 100%; height: 750px; background: radial-gradient(circle at center, #1a1a1a 0%, #000000 100%); }}
+                        canvas {{ display: block; width: 100%; height: 100%; }}
+                        #ui-layer {{ position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }}
+                        
+                        /* Header Info */
+                        #race-info {{ position: absolute; top: 20px; left: 20px; font-family: 'Inter', sans-serif; }}
+                        #race-info h1 {{ margin: 0; font-size: 24px; font-weight: 800; letter-spacing: -1px; }}
+                        #race-info p {{ margin: 5px 0 0 0; font-size: 16px; color: #888; font-family: 'Roboto Mono', monospace; }}
+                        #flag-status {{ 
+                            display: inline-block; margin-left: 10px; padding: 2px 8px; border-radius: 4px; 
+                            font-size: 14px; font-weight: bold; visibility: hidden;
+                        }}
 
-                    frames.append(go.Frame(
-                        data=[go.Scatter(
-                            x=frame_x, y=frame_y, 
-                            mode='markers', 
-                            marker=dict(
-                                color=frame_colors, 
-                                size=frame_sizes, 
-                                opacity=frame_opacities,
-                                line=dict(width=1, color='white')
-                            ),
-                            text=frame_hover, hoverinfo='text'
-                        )],
-                        layout=go.Layout(
-                            annotations=[
-                                dict(
-                                    text=lb_text, align='left', showarrow=False,
-                                    xref='paper', yref='paper', x=0.02, y=0.98,
-                                    bgcolor='rgba(0,0,0,0.5)', bordercolor='gray', borderwidth=1,
-                                    font=dict(color='white', size=10)
-                                ),
-                                dict(
-                                    text=tel_text, align='left', showarrow=False,
-                                    xref='paper', yref='paper', x=0.02, y=0.02,
-                                    bgcolor='rgba(0,0,0,0.5)', bordercolor='red', borderwidth=1,
-                                    font=dict(color='white', size=12)
-                                ),
-                                dict(
-                                    text=f"Time: {t:.1f}s", showarrow=False,
-                                    xref='paper', yref='paper', x=0.95, y=0.95,
-                                    font=dict(color='white', size=14)
-                                )
-                            ]
-                        ),
-                        name=f"{t:.1f}",
-                        traces=[1] 
-                    ))
-                
-                # --- Figure ---
-                padding = 500
-                x_min, x_max = track_x.min(), track_x.max()
-                y_min, y_max = track_y.min(), track_y.max()
-                
-                # Initial Data (First Frame)
-                initial_annotations = []
-                if frames:
-                    init_data = frames[0].data[0]
-                    if frames[0].layout and frames[0].layout.annotations:
-                        initial_annotations = frames[0].layout.annotations
-                else:
-                    init_data = go.Scatter(x=[], y=[], mode='markers')
+                        /* Leaderboard */
+                        #leaderboard {{ position: absolute; top: 20px; right: 20px; width: 220px; font-family: 'Roboto Mono', monospace; font-size: 13px; }}
+                        #leaderboard h3 {{ margin: 0 0 10px 0; text-align: right; font-family: 'Inter', sans-serif; font-weight: 800; font-size: 18px; text-transform: uppercase; }}
+                        .lb-row {{ display: flex; justify-content: space-between; margin-bottom: 4px; padding: 2px 5px; border-radius: 2px; }}
+                        .lb-row.focus {{ background: rgba(255, 255, 255, 0.15); border-left: 3px solid white; }}
+                        .lb-pos {{ width: 25px; color: #666; }}
+                        .lb-name {{ font-weight: bold; flex-grow: 1; }}
+                        .lb-gap {{ color: #aaa; }}
+                        
+                        /* Telemetry Box */
+                        #telemetry-box {{ position: absolute; top: 150px; left: 20px; width: 240px; border: 1px solid #333; background: rgba(0, 0, 0, 0.8); }}
+                        #tel-header {{ background-color: #00ffff; color: black; padding: 8px 12px; font-weight: 800; font-size: 18px; text-transform: uppercase; }}
+                        #tel-body {{ padding: 12px; font-family: 'Roboto Mono', monospace; font-size: 14px; line-height: 1.6; color: #ddd; }}
+                        .tel-row {{ display: flex; justify-content: space-between; }}
+                        .tel-label {{ color: #888; }}
+                        .tel-val {{ font-weight: bold; color: white; }}
 
-                fig = go.Figure(
-                    data=[
-                        # Trace 0: Track Map
-                        go.Scatter(x=track_x, y=track_y, mode='lines', line=dict(color='white', width=6), hoverinfo='skip'),
-                        # Trace 1: Drivers (Initial)
-                        init_data
-                    ],
-                    layout=go.Layout(
-                        title=f"Replay: {selected_lap} - {focus_driver}",
-                        template="plotly_dark",
-                        plot_bgcolor='rgba(0,0,0,0)',
-                        paper_bgcolor='rgba(0,0,0,0)',
-                        xaxis=dict(visible=False, range=[x_min - padding, x_max + padding], scaleanchor="y", scaleratio=1),
-                        yaxis=dict(visible=False, range=[y_min - padding, y_max + padding]),
-                        showlegend=False,
-                        height=700,
-                        margin=dict(l=0, r=0, t=50, b=0),
-                        annotations=initial_annotations,
-                        updatemenus=[dict(
-                            type='buttons',
-                            showactive=False,
-                            y=0, x=0.5,
-                            xanchor='center',
-                            buttons=[
-                                dict(label='▶ Play', method='animate', args=[None, dict(frame=dict(duration=100, redraw=True), fromcurrent=True)]),
-                                dict(label='⏸ Pause', method='animate', args=[[None], dict(frame=dict(duration=0, redraw=False), mode='immediate')])
-                            ],
-                            bgcolor="rgba(0,0,0,0.5)",
-                            font=dict(color="white")
-                        )],
-                        sliders=[dict(
-                            steps=[dict(method='animate', args=[[f.name], dict(mode='immediate', frame=dict(duration=0, redraw=True))], label=f.name) for f in frames],
-                            currentvalue=dict(prefix='Time: ', visible=True, xanchor='center'),
-                            len=0.9, x=0.5, xanchor='center', y=0,
-                            active=0,
-                            pad=dict(t=50, b=10),
-                            font=dict(color="white")
-                        )]
-                    ),
-                    frames=frames
-                )
+                        /* Controls Guide */
+                        #controls-guide {{ position: absolute; bottom: 20px; left: 20px; font-family: 'Roboto Mono', monospace; font-size: 11px; color: #555; line-height: 1.5; }}
+                        .key {{ border: 1px solid #444; padding: 1px 4px; border-radius: 3px; color: #888; }}
+
+                        /* Timeline & Cam Toggle */
+                        #bottom-bar {{ position: absolute; bottom: 20px; right: 20px; display: flex; align-items: center; gap: 15px; pointer-events: auto; }}
+                        #cam-toggle {{ background: #222; border: 1px solid #444; color: #888; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; font-family: 'Inter', sans-serif; font-weight: 600; transition: all 0.2s; }}
+                        #cam-toggle.active {{ background: #00ffff; color: black; border-color: #00ffff; }}
+                        
+                        /* Speed Select */
+                        #speed-select {{ background: #222; border: 1px solid #444; color: #fff; padding: 5px; border-radius: 4px; font-family: 'Roboto Mono'; font-size: 12px; cursor: pointer; }}
+                        
+                        input[type=range] {{ width: 300px; accent-color: #00ffff; cursor: pointer; }}
+                    </style>
+                </head>
+                <body>
+                    <div id="game-container">
+                        <canvas id="raceCanvas"></canvas>
+                        <div id="ui-layer">
+                            <div id="race-info">
+                                <h1><span id="lap-display">LAP {payload['lap_number']}</span> <span id="flag-status">GREEN</span></h1>
+                                <p id="race-time">TIME: 00:00.0</p>
+                            </div>
+                            
+                            <div id="leaderboard">
+                                <h3>Leaderboard</h3>
+                                <div id="lb-content"></div>
+                            </div>
+                            
+                            <div id="telemetry-box">
+                                <div id="tel-header">DRIVER: {driver_map[focus_driver_name]}</div>
+                                <div id="tel-body">
+                                    <div class="tel-row"><span class="tel-label">Speed:</span> <span class="tel-val" id="t-speed">0 km/h</span></div>
+                                    <div class="tel-row"><span class="tel-label">Gear:</span> <span class="tel-val" id="t-gear">-</span></div>
+                                    <div class="tel-row"><span class="tel-label">DRS:</span> <span class="tel-val" id="t-drs">OFF</span></div>
+                                    <div class="tel-row"><span class="tel-label">Dist:</span> <span class="tel-val" id="t-dist">0 m</span></div>
+                                </div>
+                            </div>
+                            
+                            <div id="controls-guide">
+                                <b>CONTROLS:</b><br>
+                                <span class="key">SPACE</span> Pause/Resume<br>
+                                <span class="key">←</span> / <span class="key">→</span> Seek +/- 5s<br>
+                                <span class="key">M</span> Toggle Map Mode
+                            </div>
+                            
+                            <div id="bottom-bar">
+                                <select id="speed-select" onchange="changeSpeed(this.value)">
+                                    <option value="1">1x (Real Time)</option>
+                                    <option value="5">5x</option>
+                                    <option value="10">10x</option>
+                                    <option value="20" selected>20x</option>
+                                    <option value="50">50x</option>
+                                </select>
+                                <div id="cam-toggle" onclick="toggleCamera()">FOLLOW CAM</div>
+                                <input type="range" id="timeline" min="0" max="100" value="0" step="1" oninput="seek(this.value)">
+                            </div>
+                        </div>
+                    </div>
+
+                    <script>
+                        const data = {json_data};
+                        const canvas = document.getElementById('raceCanvas');
+                        const ctx = canvas.getContext('2d');
+                        
+                        // State
+                        let currentRaceTime = data.time_steps[0];
+                        let isPlaying = false;
+                        let followCam = false;
+                        let playbackSpeed = 20; // Default to 20x for usability
+                        let lastFrameTime = 0;
+                        
+                        const startTime = data.time_steps[0];
+                        const endTime = data.time_steps[data.time_steps.length - 1];
+                        const totalDuration = endTime - startTime;
+                        
+                        // Elements
+                        const timeline = document.getElementById('timeline');
+                        const timeDisplay = document.getElementById('race-time');
+                        const lapDisplay = document.getElementById('lap-display');
+                        const flagStatus = document.getElementById('flag-status');
+                        const lbContent = document.getElementById('lb-content');
+                        const camBtn = document.getElementById('cam-toggle');
+                        
+                        // Telemetry Elements
+                        const tSpeed = document.getElementById('t-speed');
+                        const tGear = document.getElementById('t-gear');
+                        const tDrs = document.getElementById('t-drs');
+                        const tDist = document.getElementById('t-dist');
+                        
+                        timeline.min = 0;
+                        timeline.max = totalDuration;
+                        timeline.value = 0;
+                        
+                        // --- INPUT HANDLING ---
+                        document.addEventListener('keydown', (e) => {{
+                            if(e.code === 'Space') {{
+                                e.preventDefault();
+                                togglePlay();
+                            }} else if(e.code === 'ArrowRight') {{
+                                seek(Math.min(totalDuration, (currentRaceTime - startTime) + 5));
+                            }} else if(e.code === 'ArrowLeft') {{
+                                seek(Math.max(0, (currentRaceTime - startTime) - 5));
+                            }} else if(e.code === 'KeyM') {{
+                                toggleCamera();
+                            }}
+                        }});
+
+                        function togglePlay() {{
+                            isPlaying = !isPlaying;
+                            if(isPlaying) {{
+                                lastFrameTime = performance.now();
+                                requestAnimationFrame(loop);
+                            }}
+                        }}
+                        
+                        function changeSpeed(val) {{
+                            playbackSpeed = parseInt(val);
+                        }}
+                        
+                        function seek(val) {{
+                            currentRaceTime = startTime + parseFloat(val);
+                            timeline.value = val;
+                            draw();
+                        }}
+                        
+                        function toggleCamera() {{
+                            followCam = !followCam;
+                            camBtn.classList.toggle('active');
+                            draw();
+                        }}
+                        
+                        function resize() {{
+                            canvas.width = canvas.clientWidth;
+                            canvas.height = canvas.clientHeight;
+                            draw();
+                        }}
+                        window.addEventListener('resize', resize);
+                        
+                        // Pre-calc track bounds
+                        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+                        data.track.forEach(p => {{
+                            if(p.x < minX) minX = p.x;
+                            if(p.x > maxX) maxX = p.x;
+                            if(p.y < minY) minY = p.y;
+                            if(p.y > maxY) maxY = p.y;
+                        }});
+                        const trackWidth = maxX - minX;
+                        const trackHeight = maxY - minY;
+                        
+                        function loop(now) {{
+                            if(!isPlaying) return;
+                            
+                            const dt = (now - lastFrameTime) / 1000; // seconds
+                            lastFrameTime = now;
+                            
+                            currentRaceTime += dt * playbackSpeed;
+                            
+                            if(currentRaceTime >= endTime) {{
+                                currentRaceTime = startTime; // Loop or Stop? Let's loop
+                            }}
+                            
+                            timeline.value = currentRaceTime - startTime;
+                            draw();
+                            requestAnimationFrame(loop);
+                        }}
+                        
+                        function getTrackColor(t) {{
+                            let status = '1'; 
+                            if(data.track_status && data.track_status.length > 0) {{
+                                for(let i=0; i<data.track_status.length; i++) {{
+                                    if(data.track_status[i].t <= t) {{
+                                        status = data.track_status[i].s;
+                                    }} else {{
+                                        break;
+                                    }}
+                                }}
+                            }}
+                            
+                            if(status == '1') return {{c: '#666', label: 'GREEN', bg: '#00ff00', fg: 'black'}};
+                            if(status == '2') return {{c: '#ffd700', label: 'YELLOW', bg: '#ffd700', fg: 'black'}};
+                            if(status == '3') return {{c: '#ffa500', label: 'SC', bg: '#ffa500', fg: 'black'}};
+                            if(status == '4') return {{c: '#ff0000', label: 'RED', bg: '#ff0000', fg: 'white'}};
+                            if(status == '5' || status == '6' || status == '7') return {{c: '#ff8c00', label: 'VSC', bg: '#ff8c00', fg: 'black'}};
+                            
+                            return {{c: '#666', label: 'GREEN', bg: '#00ff00', fg: 'black'}};
+                        }}
+                        
+                        function getInterpolatedEntry(entries, t) {{
+                            let idx = -1;
+                            const step = data.time_steps[1] - data.time_steps[0];
+                            idx = Math.floor((t - data.time_steps[0]) / step);
+                            
+                            if(idx < 0) idx = 0;
+                            if(idx >= data.time_steps.length - 1) idx = data.time_steps.length - 2;
+                            
+                            const t1 = data.time_steps[idx];
+                            const t2 = data.time_steps[idx+1];
+                            const ratio = (t - t1) / (t2 - t1);
+                            
+                            const e1 = entries[idx];
+                            const e2 = entries[idx+1];
+                            
+                            if(!e1 || !e2) return e1 || e2; 
+                            
+                            return {{
+                                x: e1.x + (e2.x - e1.x) * ratio,
+                                y: e1.y + (e2.y - e1.y) * ratio,
+                                d: e1.d + (e2.d - e1.d) * ratio,
+                                s: Math.round(e1.s + (e2.s - e1.s) * ratio),
+                                g: e1.g, 
+                                drs: e1.drs 
+                            }};
+                        }}
+
+                        function updateLapCounter(t) {{
+                            if(data.lap_data && data.lap_data.length > 0) {{
+                                let currentLap = 1;
+                                for(let i=0; i<data.lap_data.length; i++) {{
+                                    if(data.lap_data[i].t <= t) {{
+                                        currentLap = data.lap_data[i].l;
+                                    }} else {{
+                                        break;
+                                    }}
+                                }}
+                                lapDisplay.innerText = "LAP " + currentLap;
+                            }}
+                        }}
+
+                        function draw() {{
+                            // 1. Clear
+                            ctx.fillStyle = "#000000";
+                            ctx.fillRect(0, 0, canvas.width, canvas.height);
+                            
+                            const statusInfo = getTrackColor(currentRaceTime);
+                            
+                            flagStatus.innerText = statusInfo.label;
+                            flagStatus.style.backgroundColor = statusInfo.bg;
+                            flagStatus.style.color = statusInfo.fg;
+                            flagStatus.style.visibility = 'visible';
+                            
+                            updateLapCounter(currentRaceTime);
+                            
+                            ctx.save();
+                            
+                            // 2. Camera
+                            let zoom = 1;
+                            let focusX = 0, focusY = 0;
+                            
+                            // Get Focus Driver Position First
+                            if(data.drivers[data.focus_driver]) {{
+                                const fEntry = getInterpolatedEntry(data.drivers[data.focus_driver].entries, currentRaceTime);
+                                if(fEntry) {{
+                                    focusX = fEntry.x;
+                                    focusY = fEntry.y;
+                                }}
+                            }}
+
+                            if (followCam && focusX !== 0) {{
+                                zoom = 3.5;
+                                ctx.translate(canvas.width/2, canvas.height/2);
+                                ctx.scale(zoom, zoom);
+                                ctx.translate(-focusX, -focusY);
+                            }} else {{
+                                fitTrack();
+                            }}
+                            
+                            // 3. Draw Track
+                            ctx.lineJoin = "round";
+                            ctx.lineCap = "round";
+                            
+                            // Outer Line
+                            ctx.strokeStyle = statusInfo.c;
+                            ctx.lineWidth = 14 / zoom;
+                            ctx.beginPath();
+                            data.track.forEach((p, i) => {{ i===0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y); }});
+                            ctx.stroke();
+                            
+                            // Inner Line
+                            ctx.strokeStyle = "#000000";
+                            ctx.lineWidth = 10 / zoom;
+                            ctx.beginPath();
+                            data.track.forEach((p, i) => {{ i===0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y); }});
+                            ctx.stroke();
+                            
+                            // 4. Draw Drivers
+                            const leaderboard = [];
+                            
+                            Object.keys(data.drivers).forEach(abbr => {{
+                                const drv = data.drivers[abbr];
+                                const entry = getInterpolatedEntry(drv.entries, currentRaceTime);
+                                
+                                if(entry) {{
+                                    ctx.fillStyle = drv.color;
+                                    ctx.beginPath();
+                                    ctx.arc(entry.x, entry.y, 50 / zoom, 0, Math.PI*2);
+                                    ctx.fill();
+                                    
+                                    ctx.strokeStyle = "white";
+                                    ctx.lineWidth = 4 / zoom;
+                                    ctx.stroke();
+                                    
+                                    leaderboard.push({{ abbr: abbr, dist: entry.d, color: drv.color }});
+                                    
+                                    if(abbr === data.focus_driver) {{
+                                        tSpeed.innerText = entry.s + " km/h";
+                                        tGear.innerText = entry.g;
+                                        tDrs.innerText = entry.drs ? "ON" : "OFF";
+                                        tDrs.style.color = entry.drs ? "#00ff00" : "#888";
+                                        tDist.innerText = (entry.d / 1000).toFixed(2) + " km";
+                                    }}
+                                }}
+                            }});
+                            
+                            ctx.restore();
+                            
+                            // 5. Update UI
+                            const mins = Math.floor(currentRaceTime / 60).toString().padStart(2, '0');
+                            const secs = (currentRaceTime % 60).toFixed(1).padStart(4, '0');
+                            timeDisplay.innerText = `TIME: ${{mins}}:${{secs}}`;
+                            
+                            updateLeaderboard(leaderboard);
+                        }}
+                        
+                        function fitTrack() {{
+                            const padding = 40;
+                            const scaleX = (canvas.width - padding*2) / trackWidth;
+                            const scaleY = (canvas.height - padding*2) / trackHeight;
+                            const scale = Math.min(scaleX, scaleY);
+                            const offsetX = (canvas.width - trackWidth * scale) / 2 - minX * scale;
+                            const offsetY = (canvas.height - trackHeight * scale) / 2 - minY * scale;
+                            ctx.setTransform(scale, 0, 0, scale, offsetX, offsetY);
+                        }}
+                        
+                        function updateLeaderboard(list) {{
+                            list.sort((a,b) => b.dist - a.dist);
+                            let html = "";
+                            if(list.length > 0) {{
+                                const leaderDist = list[0].dist;
+                                list.slice(0, 15).forEach((d, i) => {{
+                                    let gap = (leaderDist - d.dist) / 200.0;
+                                    let gapStr = gap > 0 ? "+" + gap.toFixed(1) + "s" : "LEADER";
+                                    const isFocus = d.abbr === data.focus_driver;
+                                    html += `
+                                        <div class="lb-row ${{isFocus ? 'focus' : ''}}">
+                                            <span class="lb-pos">${{i+1}}</span>
+                                            <span class="lb-name" style="color: ${{d.color}}">${{d.abbr}}</span>
+                                            <span class="lb-gap">${{gapStr}}</span>
+                                        </div>
+                                    `;
+                                }});
+                            }}
+                            lbContent.innerHTML = html;
+                        }}
+                        
+                        resize();
+                        draw(); // Initial draw
+                    </script>
+                </body>
+                </html>
+                """
                 
+                components.html(html_code, height=760)
                 status_text.empty()
                 progress_bar.empty()
-                st.plotly_chart(fig, use_container_width=True)
-                
+
         except Exception as e:
-            st.error(f"An error occurred during replay generation: {e}")
+            st.error(f"An error occurred: {e}")
             st.exception(e)
 
 # --- Helper for Lazy Loading ---
