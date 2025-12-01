@@ -189,6 +189,22 @@ def get_lookup_tables_v2():
         st.error(f"Error fetching lookup tables: {e}")
         return pd.DataFrame(), pd.DataFrame()
 
+@st.cache_data
+def fetch_season_standings(year):
+    try:
+        ergast = Ergast()
+        # Driver Standings
+        d_resp = ergast.get_driver_standings(season=year, limit=1)
+        d_standings = d_resp.content[0] if d_resp.content else pd.DataFrame()
+        
+        # Constructor Standings
+        c_resp = ergast.get_constructor_standings(season=year, limit=1)
+        c_standings = c_resp.content[0] if c_resp.content else pd.DataFrame()
+        
+        return d_standings, c_standings
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
+
 # --- UI Components ---
 
 def render_session_selector():
@@ -242,6 +258,40 @@ def render_session_selector():
     except Exception as e:
         st.error(f"Could not fetch schedule: {e}")
         return year, None
+
+def render_header_stats(year):
+    d_standings, c_standings = fetch_season_standings(year)
+    
+    if not d_standings.empty and not c_standings.empty:
+        try:
+            top_driver = d_standings.iloc[0]
+            top_team = c_standings.iloc[0]
+            
+            d_name = f"{top_driver['givenName']} {top_driver['familyName']}"
+            d_points = top_driver['points']
+            d_wins = top_driver['wins']
+            
+            c_name = top_team['constructorName']
+            c_points = top_team['points']
+            c_wins = top_team['wins']
+            
+            st.markdown(f"""
+            <div style="background-color: #1e1e1e; padding: 15px; border-radius: 10px; margin-bottom: 20px; border: 1px solid #333; display: flex; justify-content: space-around; align-items: center; flex-wrap: wrap;">
+                <div style="text-align: center;">
+                    <h3 style="margin: 0; color: #ff1801; font-size: 1.2em;">🏆 {year} Leader</h3>
+                    <div style="font-size: 1.5em; font-weight: bold; color: white;">{d_name}</div>
+                    <div style="font-size: 0.9em; opacity: 0.8; color: #ccc;">{d_points} PTS | {d_wins} Wins</div>
+                </div>
+                <div style="height: 40px; width: 1px; background-color: #444; margin: 0 20px;"></div>
+                <div style="text-align: center;">
+                    <h3 style="margin: 0; color: #ff1801; font-size: 1.2em;">🛠️ Top Team</h3>
+                    <div style="font-size: 1.5em; font-weight: bold; color: white;">{c_name}</div>
+                    <div style="font-size: 0.9em; opacity: 0.8; color: #ccc;">{c_points} PTS | {c_wins} Wins</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        except Exception:
+            pass
 
 def render_championship_view(year, schedule):
     st.markdown(f"## {year} Championship Overview")
@@ -638,6 +688,9 @@ st.title("🏎️ Formula 1 Realtime Dashboard")
 
 # Session Selector & Default View - Always render sidebar
 year, schedule = render_session_selector()
+
+# Header Stats
+render_header_stats(year)
 
 # Global Search
 search_query = st.text_input("Search for a Driver or Team", placeholder="e.g. Hamilton, Ferrari, Max...", key="search_query_global")
