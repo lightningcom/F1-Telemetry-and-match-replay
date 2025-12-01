@@ -477,12 +477,15 @@ def render_track_map_tab(session, selected_event_name):
             fig_map = go.Figure(go.Scatter(x=x, y=y, mode='lines', line=dict(width=4, color='white')))
             fig_map.update_layout(
                 title=f"Track Map - {selected_event_name}",
-                xaxis=dict(visible=False),
-                yaxis=dict(visible=False),
+                template="plotly_dark",
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+                xaxis=dict(visible=False, showgrid=False),
+                yaxis=dict(visible=False, showgrid=False, scaleanchor="x", scaleratio=1),
                 height=600,
                 showlegend=False
             )
-            fig_map.update_yaxes(scaleanchor="x", scaleratio=1)
+            # fig_map.update_yaxes(scaleanchor="x", scaleratio=1) # Moved inside update_layout
             st.plotly_chart(fig_map, use_container_width=True)
     except Exception as e:
         st.warning("Could not generate track map.")
@@ -594,7 +597,8 @@ def render_replay_tab(session):
                                 dict(x=1.15, y=1, xref='paper', yref='paper', text=leaderboard_text, showarrow=False, align='left', bgcolor='rgba(0,0,0,0.5)', bordercolor='#333', borderwidth=1, font=dict(color='white', family="monospace", size=12)),
                                 dict(x=-0.15, y=0.5, xref='paper', yref='paper', text=tel_text, showarrow=False, align='left', bgcolor='rgba(0,0,0,0.5)', bordercolor=focus_info['color'] if focus_info else '#333', borderwidth=2, font=dict(color='white', family="monospace", size=14)),
                                 dict(x=0, y=1.1, xref='paper', yref='paper', text=f"Time: {t:.1f}s", showarrow=False, align='left', font=dict(color='white', size=16))
-                            ]), name=f"{t:.1f}"
+                            ]), name=f"{t:.1f}",
+                            traces=[1] 
                         ))
 
                     if not frames:
@@ -640,26 +644,25 @@ search_query = st.text_input("Search for a Driver or Team", placeholder="e.g. Ha
 
 if search_query:
     render_search_ui(search_query)
+elif 'session' in st.session_state:
+    session = st.session_state['session']
+    st.header(f"🏁 {st.session_state['loaded_event']}")
+    
+    # Tabs
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Results", "🏎️ Telemetry", "⏱️ Lap Comparison", "🗺️ Track Map", "🎥 Race Replay"])
+    
+    with tab1:
+        render_results_tab(session)
+    with tab2:
+        render_telemetry_tab(session)
+    with tab3:
+        render_lap_comparison_tab(session)
+    with tab4:
+        event_name = st.session_state['loaded_event'].split(' - ')[0]
+        render_track_map_tab(session, event_name)
+    with tab5:
+        render_replay_tab(session)
+        
 else:
-    if 'session' in st.session_state:
-        session = st.session_state['session']
-        st.header(f"🏁 {st.session_state['loaded_event']}")
-        
-        # Tabs
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Results", "🏎️ Telemetry", "⏱️ Lap Comparison", "🗺️ Track Map", "🎥 Race Replay"])
-        
-        with tab1:
-            render_results_tab(session)
-        with tab2:
-            render_telemetry_tab(session)
-        with tab3:
-            render_lap_comparison_tab(session)
-        with tab4:
-            event_name = st.session_state['loaded_event'].split(' - ')[0]
-            render_track_map_tab(session, event_name)
-        with tab5:
-            render_replay_tab(session)
-            
-    else:
-        # Default View (Calendar/Standings)
-        render_championship_view(year, schedule)
+    # Default View (Calendar/Standings)
+    render_championship_view(year, schedule)
