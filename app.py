@@ -1038,15 +1038,18 @@ def render_replay_tab(session):
                 y_min, y_max = track_y.min(), track_y.max()
                 
                 # Initial Data (First Frame)
+                initial_annotations = []
                 if frames:
                     init_data = frames[0].data[0]
+                    if frames[0].layout and frames[0].layout.annotations:
+                        initial_annotations = frames[0].layout.annotations
                 else:
                     init_data = go.Scatter(x=[], y=[], mode='markers')
 
                 fig = go.Figure(
                     data=[
                         # Trace 0: Track Map
-                        go.Scatter(x=track_x, y=track_y, mode='lines', line=dict(color='#333', width=8), hoverinfo='skip'),
+                        go.Scatter(x=track_x, y=track_y, mode='lines', line=dict(color='white', width=6), hoverinfo='skip'),
                         # Trace 1: Drivers (Initial)
                         init_data
                     ],
@@ -1060,6 +1063,7 @@ def render_replay_tab(session):
                         showlegend=False,
                         height=700,
                         margin=dict(l=0, r=0, t=50, b=0),
+                        annotations=initial_annotations,
                         updatemenus=[dict(
                             type='buttons',
                             showactive=False,
